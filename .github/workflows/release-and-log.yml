@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: Target environment (version bump only happens for uat)
+        description: Target environment (only prod creates a version)
         type: choice
-        options: [dev, uat]
+        options: [dev, val, uat, prod]
         default: dev
       bump:
-        description: Version bump (used only for uat)
+        description: Version bump (used only for prod)
         type: choice
         options: [patch, minor, major]
         default: patch
@@ -17,6 +17,7 @@ on:
 permissions:
   contents: write
 
+# Runs wait in line instead of running in parallel, so each prod run sees the previous run's tag.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -24,26 +25,37 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # Matches a GitHub Environment (dev, val, uat, prod); add required reviewers on prod for approval
+    environment: ${{ inputs.environment }}
     steps:
+      - name: Restrict prod to main
+        if: inputs.environment == 'prod' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Prod deployments are only allowed from main (current: ${GITHUB_REF_NAME})"
+          exit 1
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Calculate version
+      - name: Calculate version (prod only)
         id: version
         env:
           ENVIRONMENT: ${{ inputs.environment }}
           BUMP: ${{ inputs.bump }}
         run: |
-          last=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
-          last=${last:-v0.0.0}
-
-          if [ "$ENVIRONMENT" != "uat" ]; then
-            echo "Environment is $ENVIRONMENT: no version bump, keeping $last"
-            echo "tag=$last" >> "$GITHUB_OUTPUT"
+          if [ "$ENVIRONMENT" != "prod" ]; then
+            git fetch --tags --force
+            latest=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1 || true)
+            echo "$ENVIRONMENT deployment: no version, no tag (app shows latest prod: ${latest:-none})"
+            echo "tag=-" >> "$GITHUB_OUTPUT"
+            echo "app_version=${latest:-unversioned}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
+          git fetch --tags --force
+          last=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1 || true)
+          last=${last:-v0.0.0}
           IFS=. read -r major minor patch <<< "${last#v}"
           case "$BUMP" in
             major) major=$((major+1)); minor=0; patch=0 ;;
@@ -54,9 +66,38 @@ jobs:
           new="v${major}.${minor}.${patch}"
           echo "Previous: $last  ->  New: $new ($BUMP)"
           echo "tag=$new" >> "$GITHUB_OUTPUT"
+          echo "app_version=$new" >> "$GITHUB_OUTPUT"
 
-      - name: Create and push tag (uat only)
-        if: inputs.environment == 'uat'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Build with version info
+        env:
+          VITE_APP_VERSION: ${{ steps.version.outputs.app_version }}
+          VITE_COMMIT_SHA: ${{ github.sha }}
+          VITE_APP_ENV: ${{ inputs.environment }}
+        run: |
+          npm ci
+          npm run build
+
+      - name: Upload build (downloadable from the run page)
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ inputs.environment }}-${{ github.run_number }}
+          path: dist
+          retention-days: 30
+
+      - name: Upload build for GitHub Pages (prod only)
+        if: inputs.environment == 'prod'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      # Tag only after the build succeeds, so a failed build never leaves a release tag behind
+      - name: Create and push tag (prod only)
+        if: inputs.environment == 'prod'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -76,15 +117,38 @@ jobs:
           if [ ! -f "$file" ]; then
             echo "environment,version,pushed_by,commit_id,datetime_utc" > "$file"
           fi
-          echo "${ENVIRONMENT},${TAG},${ACTOR},${GITHUB_SHA},$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$file"
+          echo "${ENVIRONMENT},${TAG},${ACTOR},$(git rev-parse HEAD),$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$file"
 
           git add "$file"
-          git commit -m "chore: log deployment ${TAG} to ${ENVIRONMENT}"
-          git pull --rebase origin "${GITHUB_REF_NAME}"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git commit -m "chore: log deployment to ${ENVIRONMENT} (${TAG})"
 
-      - name: Create GitHub Release (uat only)
-        if: inputs.environment == 'uat'
+          # If the branch moved meanwhile, merge it (keeps a visible merge commit) and push again
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              exit 0
+            fi
+            echo "Push rejected (attempt $attempt), merging latest ${GITHUB_REF_NAME}"
+            git pull --no-rebase --no-ff -m "Merge ${GITHUB_REF_NAME} before logging ${ENVIRONMENT} deployment" origin "${GITHUB_REF_NAME}"
+          done
+          echo "::error::Could not push deployment log after 3 attempts"
+          exit 1
+
+      - name: Create GitHub Release (prod only)
+        if: inputs.environment == 'prod'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "${{ steps.version.outputs.tag }}" --generate-notes --title "${{ steps.version.outputs.tag }}"
+
+  deploy-pages:
+    if: inputs.environment == 'prod'
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
