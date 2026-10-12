@@ -1,0 +1,90 @@
+name: Deploy (Version, Tag and Log)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment (version bump only happens for uat)
+        type: choice
+        options: [dev, uat]
+        default: dev
+      bump:
+        description: Version bump (used only for uat)
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calculate version
+        id: version
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          BUMP: ${{ inputs.bump }}
+        run: |
+          last=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
+          last=${last:-v0.0.0}
+
+          if [ "$ENVIRONMENT" != "uat" ]; then
+            echo "Environment is $ENVIRONMENT: no version bump, keeping $last"
+            echo "tag=$last" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          IFS=. read -r major minor patch <<< "${last#v}"
+          case "$BUMP" in
+            major) major=$((major+1)); minor=0; patch=0 ;;
+            minor) minor=$((minor+1)); patch=0 ;;
+            *) patch=$((patch+1)) ;;
+          esac
+
+          new="v${major}.${minor}.${patch}"
+          echo "Previous: $last  ->  New: $new ($BUMP)"
+          echo "tag=$new" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push tag (uat only)
+        if: inputs.environment == 'uat'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Append deployment history CSV
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          TAG: ${{ steps.version.outputs.tag }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p deployment-history
+          file="deployment-history/deployments.csv"
+          if [ ! -f "$file" ]; then
+            echo "environment,version,pushed_by,commit_id,datetime_utc" > "$file"
+          fi
+          echo "${ENVIRONMENT},${TAG},${ACTOR},${GITHUB_SHA},$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$file"
+
+          git add "$file"
+          git commit -m "chore: log deployment ${TAG} to ${ENVIRONMENT}"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Create GitHub Release (uat only)
+        if: inputs.environment == 'uat'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ steps.version.outputs.tag }}" --generate-notes --title "${{ steps.version.outputs.tag }}"
